@@ -1,0 +1,23 @@
+{
+  "name": "youtube-downloader",
+  "version": "1.0.0",
+  "description": "YouTube Shorts downloader with React frontend and Express backend",
+  "main": "server/index.js",
+  "scripts": {
+    "dev": "concurrently -n \"server,client\" -c \"yellow,cyan\" \"node server/index.js\" \"cd client && npm run dev\"",
+    "server": "node server/index.js",
+    "client": "cd client && npm run dev",
+    "setup": "npm install && cd client && npm install",
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "ffmpeg-static": "^5.3.0",
+    "youtube-dl-exec": "^2.5.8",
+    "youtubei.js": "^17.0.1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}

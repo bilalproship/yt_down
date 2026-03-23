@@ -61,6 +61,21 @@ const IconCheck = () => (
   </svg>
 )
 
+const IconMic = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
+    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+    <line x1="12" y1="19" x2="12" y2="23"/>
+    <line x1="8" y1="23" x2="16" y2="23"/>
+  </svg>
+)
+
+const IconWaveform = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" width="16" height="16">
+    <path d="M2 12h2M6 8v8M10 5v14M14 9v6M18 7v10M22 12h-2"/>
+  </svg>
+)
+
 // ── Utility ───────────────────────────────────────────────────────────────────
 
 function formatViews(n) {
@@ -109,10 +124,164 @@ function FormatRow({ format, selected, onSelect }) {
 }
 
 const MODES = [
-  { value: 'both',  label: '🔊 Audio + Video' },
-  { value: 'video', label: '🎬 Video Only' },
-  { value: 'audio', label: '🎵 Audio Only' },
+  { value: 'both',       label: '🔊 Audio + Video' },
+  { value: 'video',      label: '🎬 Video Only' },
+  { value: 'audio',      label: '🎵 Audio Only' },
+  { value: 'transcribe', label: '📝 Transcribe' },
 ]
+
+const WHISPER_MODELS = [
+  { value: 'tiny',   label: 'Tiny',   note: 'Fastest, lower accuracy' },
+  { value: 'small',  label: 'Small',  note: 'Balanced (recommended)' },
+  { value: 'medium', label: 'Medium', note: 'Slower, better accuracy' },
+  { value: 'large-v3', label: 'Large v3', note: 'Best accuracy, slowest' },
+]
+
+function formatTimestamp(seconds) {
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
+
+function TranscribePanel({ url }) {
+  const [model, setModel] = useState('small')
+  const [status, setStatus] = useState('idle') // idle | running | done | error
+  const [statusMsg, setStatusMsg] = useState('')
+  const [language, setLanguage] = useState(null)
+  const [segments, setSegments] = useState([])
+  const [copied, setCopied] = useState(false)
+  const [error, setError] = useState(null)
+  const esRef = useRef(null)
+
+  const startTranscription = () => {
+    if (esRef.current) esRef.current.close()
+    setStatus('running')
+    setStatusMsg('Connecting…')
+    setSegments([])
+    setLanguage(null)
+    setError(null)
+
+    const qs = new URLSearchParams({ url, model })
+    const es = new EventSource(`/api/transcribe?${qs}`)
+    esRef.current = es
+
+    es.onmessage = (e) => {
+      const event = JSON.parse(e.data)
+
+      if (event.type === 'status') {
+        setStatusMsg(event.message)
+      } else if (event.type === 'info') {
+        setLanguage(event.language)
+        setStatusMsg(`Transcribing (detected: ${event.language})…`)
+      } else if (event.type === 'segment') {
+        setSegments(prev => [...prev, event])
+      } else if (event.type === 'done') {
+        setStatus('done')
+        es.close()
+      } else if (event.type === 'error') {
+        setError(event.message)
+        setStatus('error')
+        es.close()
+      }
+    }
+
+    es.onerror = () => {
+      setError('Connection to server lost.')
+      setStatus('error')
+      es.close()
+    }
+  }
+
+  const handleCopy = () => {
+    const text = segments.map(s => s.text).join(' ')
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
+  const fullText = segments.map(s => s.text).join(' ')
+
+  return (
+    <div className="transcribe-panel">
+      {/* Model picker */}
+      <div className="transcribe-model-row">
+        <span className="formats-label">Whisper model</span>
+        <div className="model-select-wrap">
+          <select
+            className="model-select"
+            value={model}
+            onChange={e => setModel(e.target.value)}
+            disabled={status === 'running'}
+          >
+            {WHISPER_MODELS.map(m => (
+              <option key={m.value} value={m.value}>{m.label} — {m.note}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {/* Start button */}
+      <button
+        className={`btn-transcribe ${status === 'running' ? 'loading' : ''}`}
+        onClick={startTranscription}
+        disabled={status === 'running'}
+      >
+        {status === 'running' ? (
+          <><IconSpinner /> {statusMsg || 'Transcribing…'}</>
+        ) : status === 'done' ? (
+          <><IconMic /> Transcribe Again</>
+        ) : (
+          <><IconMic /> Start Transcription</>
+        )}
+      </button>
+
+      {/* Error */}
+      {status === 'error' && error && (
+        <div className="error-box" style={{ marginTop: 0 }}>
+          <strong>Error:</strong> {error}
+        </div>
+      )}
+
+      {/* Transcript output */}
+      {(segments.length > 0 || status === 'done') && (
+        <div className="transcript-box">
+          <div className="transcript-header">
+            <span className="transcript-label">
+              <IconWaveform />
+              Transcript
+              {language && <span className="lang-badge">{language.toUpperCase()}</span>}
+            </span>
+            <button
+              className={`btn-copy-transcript ${copied ? 'copied' : ''}`}
+              onClick={handleCopy}
+              disabled={segments.length === 0}
+            >
+              {copied ? <><IconCheck /> Copied!</> : <><IconCopy /> Copy all</>}
+            </button>
+          </div>
+          <div className="transcript-segments">
+            {segments.map((seg, i) => (
+              <div key={i} className="transcript-segment">
+                <span className="seg-time">{formatTimestamp(seg.start)}</span>
+                <span className="seg-text">{seg.text}</span>
+              </div>
+            ))}
+            {status === 'running' && segments.length === 0 && (
+              <div className="transcript-placeholder">Processing audio…</div>
+            )}
+          </div>
+          {status === 'done' && (
+            <div className="transcript-full">
+              <p className="formats-label" style={{ marginBottom: 6 }}>Plain text</p>
+              <p className="transcript-plain">{fullText}</p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function VideoCard({ info, url, onReset }) {
   const [selectedItag, setSelectedItag] = useState(info.formats[0]?.itag)
@@ -144,6 +313,7 @@ function VideoCard({ info, url, onReset }) {
 
   const selectedFormat = info.formats.find(f => String(f.itag) === String(selectedItag))
   const audioOnly = mode === 'audio'
+  const transcribeMode = mode === 'transcribe'
 
   return (
     <div className="video-card">
@@ -192,64 +362,78 @@ function VideoCard({ info, url, onReset }) {
           </div>
         </div>
 
-        {/* Format selector */}
-        <div className={`formats-section ${audioOnly ? 'dimmed' : ''}`}>
-          <p className="formats-label">
-            {audioOnly ? 'Quality (not applicable for audio)' : 'Select quality'}
-          </p>
-          {audioOnly ? (
-            <p className="audio-only-note">
-              <IconInfo /> Best available audio quality will be downloaded automatically as a <strong>.m4a</strong> file.
+        {/* Format selector — hidden in transcribe mode */}
+        {!transcribeMode && (
+          <div className={`formats-section ${audioOnly ? 'dimmed' : ''}`}>
+            <p className="formats-label">
+              {audioOnly ? 'Quality (not applicable for audio)' : 'Select quality'}
             </p>
-          ) : (
-            <>
-              <div className="formats-list">
-                {info.formats.map(f => (
-                  <FormatRow
-                    key={f.itag}
-                    format={f}
-                    selected={String(selectedItag) === String(f.itag)}
-                    onSelect={setSelectedItag}
-                  />
-                ))}
-              </div>
-              {mode === 'both' && selectedFormat?.type === 'mux' && (
-                <p className="mux-note">
-                  <IconInfo /> HD download: the server will merge the video and audio streams in real time. May take a few seconds to start.
-                </p>
-              )}
-              {mode === 'video' && (
-                <p className="mux-note" style={{ color: '#a78bfa', borderColor: 'rgba(167,139,250,0.2)', background: 'rgba(167,139,250,0.08)' }}>
-                  <IconInfo /> Video-only: no audio track will be included in the downloaded file.
-                </p>
-              )}
-            </>
-          )}
-        </div>
-
-        {/* Actions */}
-        <div className="card-actions">
-          <button
-            className={`btn-download ${downloading ? 'loading' : ''} ${dlDone ? 'done' : ''}`}
-            onClick={handleDownload}
-            disabled={downloading || (mode !== 'audio' && !selectedItag)}
-          >
-            {downloading ? (
-              <><IconSpinner /> Preparing…</>
-            ) : dlDone ? (
-              <><IconCheck /> Download started!</>
-            ) : mode === 'audio' ? (
-              <><IconDownload /> Download Audio</>
-            ) : mode === 'video' ? (
-              <><IconDownload /> Download Video Only</>
+            {audioOnly ? (
+              <p className="audio-only-note">
+                <IconInfo /> Best available audio quality will be downloaded automatically as a <strong>.m4a</strong> file.
+              </p>
             ) : (
-              <><IconDownload /> Download Video</>
+              <>
+                <div className="formats-list">
+                  {info.formats.map(f => (
+                    <FormatRow
+                      key={f.itag}
+                      format={f}
+                      selected={String(selectedItag) === String(f.itag)}
+                      onSelect={setSelectedItag}
+                    />
+                  ))}
+                </div>
+                {mode === 'both' && selectedFormat?.type === 'mux' && (
+                  <p className="mux-note">
+                    <IconInfo /> HD download: the server will merge the video and audio streams in real time. May take a few seconds to start.
+                  </p>
+                )}
+                {mode === 'video' && (
+                  <p className="mux-note" style={{ color: '#a78bfa', borderColor: 'rgba(167,139,250,0.2)', background: 'rgba(167,139,250,0.08)' }}>
+                    <IconInfo /> Video-only: no audio track will be included in the downloaded file.
+                  </p>
+                )}
+              </>
             )}
-          </button>
-          <button className="btn-reset" onClick={onReset} title="Search another video">
-            <IconClear /> New search
-          </button>
-        </div>
+          </div>
+        )}
+
+        {/* Transcribe panel */}
+        {transcribeMode && <TranscribePanel url={url} />}
+
+        {/* Actions — hidden in transcribe mode (TranscribePanel has its own button) */}
+        {!transcribeMode && (
+          <div className="card-actions">
+            <button
+              className={`btn-download ${downloading ? 'loading' : ''} ${dlDone ? 'done' : ''}`}
+              onClick={handleDownload}
+              disabled={downloading || (mode !== 'audio' && !selectedItag)}
+            >
+              {downloading ? (
+                <><IconSpinner /> Preparing…</>
+              ) : dlDone ? (
+                <><IconCheck /> Download started!</>
+              ) : mode === 'audio' ? (
+                <><IconDownload /> Download Audio</>
+              ) : mode === 'video' ? (
+                <><IconDownload /> Download Video Only</>
+              ) : (
+                <><IconDownload /> Download Video</>
+              )}
+            </button>
+            <button className="btn-reset" onClick={onReset} title="Search another video">
+              <IconClear /> New search
+            </button>
+          </div>
+        )}
+        {transcribeMode && (
+          <div className="card-actions" style={{ marginTop: 0 }}>
+            <button className="btn-reset" onClick={onReset} title="Search another video">
+              <IconClear /> New search
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )

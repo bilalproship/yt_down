@@ -4,6 +4,8 @@ const { Readable } = require('stream');
 const { createContext, Script } = require('node:vm');
 const { spawn } = require('child_process');
 const path = require('path');
+const os = require('os');
+const fs = require('fs');
 
 // yt-dlp binary (auto-installed by youtube-dl-exec)
 const YTDLP_PATH = require('youtube-dl-exec').constants.YOUTUBE_DL_PATH;
@@ -383,6 +385,118 @@ app.get('/api/download', async (req, res) => {
 app.get('/api/validate', (req, res) => {
   const { url } = req.query;
   res.json({ valid: !!url && extractVideoId(url) !== null });
+});
+
+/**
+ * GET /api/transcribe?url=<yt_url>&model=<model_size>
+ *
+ * Downloads audio via yt-dlp, transcribes via faster-whisper, and streams
+ * results back as Server-Sent Events (SSE).
+ *
+ * SSE event types forwarded from the Python worker:
+ *   info    — detected language + confidence
+ *   segment — timestamped text chunk
+ *   done    — transcription complete
+ *   error   — something went wrong
+ */
+app.get('/api/transcribe', async (req, res) => {
+  const { url, model = 'small' } = req.query;
+  if (!url) return res.status(400).json({ error: 'url query param is required' });
+
+  const videoId = extractVideoId(url);
+  if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL' });
+
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const sendEvent = (data) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const tmpFile = path.join(os.tmpdir(), `yt_transcribe_${Date.now()}_${videoId}.m4a`);
+  let ytdlpProc = null;
+  let pythonProc = null;
+
+  const cleanup = () => {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  };
+
+  req.on('close', () => {
+    ytdlpProc?.kill('SIGKILL');
+    pythonProc?.kill('SIGKILL');
+    cleanup();
+  });
+
+  try {
+    // Step 1: download best audio to a temp file
+    sendEvent({ type: 'status', message: 'Downloading audio…' });
+
+    await new Promise((resolve, reject) => {
+      const args = [
+        url,
+        '-f', 'bestaudio[ext=m4a]/bestaudio',
+        '--no-playlist',
+        '-o', tmpFile,
+      ];
+      ytdlpProc = spawn(YTDLP_PATH, args);
+      let stderr = '';
+      ytdlpProc.stderr.on('data', d => { stderr += d.toString(); });
+      ytdlpProc.on('error', reject);
+      ytdlpProc.on('close', code => {
+        if (code === 0) resolve();
+        else reject(new Error(`yt-dlp exited ${code}: ${stderr.slice(0, 300)}`));
+      });
+    });
+
+    // Step 2: transcribe with faster-whisper via Python script
+    sendEvent({ type: 'status', message: `Transcribing with faster-whisper (${model})…` });
+
+    const scriptPath = path.join(__dirname, 'transcribe.py');
+    const venvPython = path.join(__dirname, '.venv', 'bin', 'python3');
+    const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python3';
+    await new Promise((resolve, reject) => {
+      pythonProc = spawn(pythonBin, [scriptPath, tmpFile, model]);
+
+      let lineBuf = '';
+
+      pythonProc.stdout.on('data', chunk => {
+        lineBuf += chunk.toString();
+        const lines = lineBuf.split('\n');
+        lineBuf = lines.pop(); // keep incomplete trailing line
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const event = JSON.parse(line);
+            sendEvent(event);
+            if (event.type === 'error') reject(new Error(event.message));
+          } catch {
+            // ignore non-JSON lines (e.g. Python warnings)
+          }
+        }
+      });
+
+      pythonProc.stderr.on('data', d => {
+        const msg = d.toString().trim();
+        if (msg) process.stdout.write(`[transcribe.py] ${msg}\n`);
+      });
+
+      pythonProc.on('error', reject);
+      pythonProc.on('close', code => {
+        if (code === 0 || code === null) resolve();
+        else reject(new Error(`Python worker exited with code ${code}`));
+      });
+    });
+
+  } catch (err) {
+    console.error('[/api/transcribe]', err.message);
+    sendEvent({ type: 'error', message: err.message });
+  } finally {
+    cleanup();
+    res.end();
+  }
 });
 
 app.listen(PORT, () => {

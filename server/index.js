@@ -9,12 +9,24 @@ const path = require('path');
 const YTDLP_PATH = require('youtube-dl-exec').constants.YOUTUBE_DL_PATH;
 // ffmpeg binary (bundled by ffmpeg-static)
 const FFMPEG_PATH = require('ffmpeg-static');
-const FFMPEG_DIR  = path.dirname(FFMPEG_PATH);
 
 const app = express();
 const PORT = 3002;
 
 app.use(cors());
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const YT_FETCH_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Referer': 'https://www.youtube.com/',
+  'Origin': 'https://www.youtube.com',
+};
+
+// Same headers formatted for ffmpeg's -headers flag
+const YT_FFMPEG_HEADERS = Object.entries(YT_FETCH_HEADERS)
+  .map(([k, v]) => `${k}: ${v}`)
+  .join('\r\n') + '\r\n';
 
 // ── Innertube init ────────────────────────────────────────────────────────────
 let _yt = null;
@@ -75,8 +87,45 @@ function sanitizeFilename(name) {
     .slice(0, 200) || 'video';
 }
 
-function mimeContainer(mimeType) {
-  return (mimeType || '').split('/')[1]?.split(';')[0] || 'mp4';
+/**
+ * Resolve CDN URL(s) for a video via yt-dlp --get-url.
+ * Returns an array of URL strings (usually 1 for video-only/audio-only, 2 for combined).
+ */
+function resolveYtdlp(videoUrl, fmtSpec) {
+  return new Promise((resolve, reject) => {
+    let out = '', err = '';
+    const proc = spawn(YTDLP_PATH, [videoUrl, '-f', fmtSpec, '--get-url', '--no-playlist']);
+    proc.stdout.on('data', d => { out += d.toString(); });
+    proc.stderr.on('data', d => { err += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', code => {
+      const lines = out.trim().split('\n').filter(Boolean);
+      if (lines.length >= 1) resolve(lines);
+      else reject(new Error(`yt-dlp --get-url failed (exit ${code}): ${err.slice(0, 300)}`));
+    });
+  });
+}
+
+/**
+ * Proxy a single CDN URL directly to the HTTP response (no transcoding).
+ * Passes through content-length and range headers for resumable downloads.
+ */
+async function proxyDirectUrl(cdnUrl, req, res) {
+  const headers = { ...YT_FETCH_HEADERS };
+  if (req.headers.range) headers['Range'] = req.headers.range;
+
+  const upstream = await fetch(cdnUrl, { headers });
+  if (!upstream.ok && upstream.status !== 206) {
+    throw new Error(`YouTube CDN returned HTTP ${upstream.status}`);
+  }
+
+  res.status(upstream.status);
+  ['content-length', 'content-range', 'accept-ranges'].forEach(h => {
+    const v = upstream.headers.get(h);
+    if (v) res.setHeader(h, v);
+  });
+
+  Readable.fromWeb(upstream.body).pipe(res);
 }
 
 /**
@@ -102,37 +151,37 @@ function buildFormatList(streamingData) {
       hasVideo: true,
       type: 'combined',
       fps: f.fps || null,
+      height: f.height || parseInt(f.quality_label) || null,
       size: f.content_length
         ? `${(parseInt(f.content_length) / 1024 / 1024).toFixed(1)} MB`
         : 'Unknown',
     }));
 
   // --- Video-only adaptive (mp4 / H.264) ---
-  // Filter: mp4 container, minimum 360p, maximum 1080p, no duplicates on height
   const seenHeights = new Set(combined.map(f => parseInt(f.quality)));
   const adaptive = (streamingData.adaptive_formats || [])
     .filter(f => {
-      if (!/^video\/mp4/.test(f.mime_type || '')) return false;  // mp4 only
+      if (!/^video\/mp4/.test(f.mime_type || '')) return false;
       if (!f.height || f.height < 360 || f.height > 1080) return false;
       return true;
     })
     .sort((a, b) => (parseInt(b.quality_label) || b.height || 0)
                   - (parseInt(a.quality_label) || a.height || 0))
-    // Pick best fps variant per height
     .reduce((acc, f) => {
       const key = `${f.height}p${f.fps > 30 ? f.fps : ''}`;
       if (!acc.find(x => `${x.height}p${x.fps > 30 ? x.fps : ''}` === key)) acc.push(f);
       return acc;
     }, [])
-    .filter(f => !seenHeights.has(f.height))  // skip heights already in combined
+    .filter(f => !seenHeights.has(f.height))
     .map(f => ({
       itag: f.itag,
       quality: f.quality_label || `${f.height}p`,
       container: 'mp4',
       hasAudio: false,
       hasVideo: true,
-      type: 'mux', // requires ffmpeg mux with audio stream
+      type: 'mux',
       fps: f.fps || null,
+      height: f.height || parseInt(f.quality_label) || null,
       size: f.content_length
         ? `${(parseInt(f.content_length) / 1024 / 1024).toFixed(1)} MB`
         : 'Unknown',
@@ -142,16 +191,6 @@ function buildFormatList(streamingData) {
     ...combined.sort((a, b) => (parseInt(b.quality) || 0) - (parseInt(a.quality) || 0)),
     ...adaptive,
   ];
-}
-
-/**
- * Pick the best AAC audio stream (mp4a codec) for muxing with mp4 video.
- * Prefers highest bitrate.
- */
-function getBestAudioFormat(streamingData) {
-  return (streamingData.adaptive_formats || [])
-    .filter(f => /^audio\/mp4/.test(f.mime_type || '') && f.has_audio)
-    .sort((a, b) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0] || null;
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -198,15 +237,19 @@ app.get('/api/info', async (req, res) => {
 });
 
 /**
- * GET /api/download?url=<yt_url>&itag=<itag>
+ * GET /api/download?url=<yt_url>&itag=<itag>&mode=<both|video|audio>
  *
- * For combined formats:  deciphers the CDN URL and proxies the stream directly.
- * For adaptive (mux) formats: deciphers both the video-only and best AAC audio
- *   streams, then pipes them into ffmpeg (stream copy) to produce a fragmented
- *   mp4 that can be streamed to the browser in real time.
+ * mode=both  (default) — video + audio merged (existing behaviour)
+ * mode=video — video stream only, no audio track (.mp4)
+ * mode=audio — best audio stream only (.m4a)
+ *
+ * For mode=both:
+ *   - Combined (SD) formats: decipher CDN URL via youtubei.js and proxy directly.
+ *   - Adaptive HD formats: resolve URLs via yt-dlp then mux with ffmpeg.
+ * For mode=video and mode=audio: resolve URL via yt-dlp and proxy directly.
  */
 app.get('/api/download', async (req, res) => {
-  const { url, itag } = req.query;
+  const { url, itag, mode = 'both' } = req.query;
   if (!url) return res.status(400).json({ error: 'url query param is required' });
 
   const videoId = extractVideoId(url);
@@ -220,6 +263,19 @@ app.get('/api/download', async (req, res) => {
       return res.status(403).json({ error: 'Video is unavailable.' });
     }
 
+    const title = sanitizeFilename(info.basic_info.title);
+
+    // ── Audio-only ───────────────────────────────────────────────────────────
+    if (mode === 'audio') {
+      console.log(`[audio] resolving best audio via yt-dlp`);
+      const cdnUrls = await resolveYtdlp(url, 'bestaudio[ext=m4a]/bestaudio');
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(title + '.m4a')}`);
+      res.setHeader('Content-Type', 'audio/mp4');
+      await proxyDirectUrl(cdnUrls[0], req, res);
+      return;
+    }
+
+    // ── Resolve the selected video format ────────────────────────────────────
     const allFormats = [
       ...(info.streaming_data.formats || []),
       ...(info.streaming_data.adaptive_formats || []),
@@ -235,34 +291,29 @@ app.get('/api/download', async (req, res) => {
     }
     if (!format) return res.status(404).json({ error: 'No suitable format found.' });
 
-    const title = sanitizeFilename(info.basic_info.title);
-    const filename = `${title}.mp4`;
-
-    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(title + '.mp4')}`);
     res.setHeader('Content-Type', 'video/mp4');
 
+    // ── Video-only ───────────────────────────────────────────────────────────
+    if (mode === 'video') {
+      const h = format.height || parseInt(format.quality_label) || 720;
+      const fmtSpec = [
+        `bestvideo[vcodec^=avc][height<=${h}][ext=mp4]`,
+        `bestvideo[height<=${h}]`,
+      ].join('/');
+      console.log(`[video-only] resolving video stream via yt-dlp — height<=${h}`);
+      const cdnUrls = await resolveYtdlp(url, fmtSpec);
+      await proxyDirectUrl(cdnUrls[0], req, res);
+      return;
+    }
+
+    // ── Both: video + audio ──────────────────────────────────────────────────
     const needsMux = !format.has_audio; // video-only adaptive (SABR) stream
 
     if (needsMux) {
-      // ── HD path ──────────────────────────────────────────────────────────
-      // YouTube's adaptive formats (480p–1080p) use Server-side ABR (SABR)
-      // which doesn't expose direct stream URLs in the format proto.
-      //
-      // Strategy:
-      //   1. Ask yt-dlp to resolve the actual CDN URLs (--get-url, no download).
-      //      yt-dlp implements the SABR protocol and prints two lines:
-      //      line 1 = video CDN URL, line 2 = audio CDN URL.
-      //   2. Feed both URLs into the local ffmpeg-static binary, which merges
-      //      them as a fragmented mp4 (streamable without seeking) and writes
-      //      the result directly to the HTTP response.
-
-      // Use the actual pixel height from the format metadata.
-      // For portrait/Shorts videos, quality_label "480p" means width=480,
-      // but yt-dlp's height selector refers to the taller dimension (e.g. 854).
-      // Using format.height gives us the correct pixel height to constrain by.
+      // HD path: use yt-dlp to get CDN URLs, then ffmpeg to mux into fragmented mp4.
       const actualHeight = format.height || parseInt(format.quality_label) || 720;
 
-      // Prefer H.264 + AAC (stream-copy, no re-encode). Fall back broadly.
       const fmtSpec = [
         `bestvideo[vcodec^=avc][height<=${actualHeight}]+bestaudio[ext=m4a]`,
         `bestvideo[ext=mp4][height<=${actualHeight}]+bestaudio[ext=m4a]`,
@@ -271,43 +322,21 @@ app.get('/api/download', async (req, res) => {
 
       console.log(`[yt-dlp] resolving URLs — quality: ${format.quality_label || actualHeight + 'p'} (actualHeight=${actualHeight})`);
 
-      // Step 1: get CDN URLs from yt-dlp (no actual download)
-      const cdnUrls = await new Promise((resolve, reject) => {
-        let out = '', err = '';
-        const proc = spawn(YTDLP_PATH, [
-          url, '-f', fmtSpec, '--get-url', '--no-playlist',
-        ]);
-        proc.stdout.on('data', d => { out += d.toString(); });
-        proc.stderr.on('data', d => { err += d.toString(); });
-        proc.on('error', reject);
-        proc.on('close', code => {
-          const lines = out.trim().split('\n').filter(Boolean);
-          if (lines.length >= 1) resolve(lines);
-          else reject(new Error(`yt-dlp --get-url failed (exit ${code}): ${err.slice(0, 300)}`));
-        });
-      });
-
+      const cdnUrls = await resolveYtdlp(url, fmtSpec);
       const videoUrl = cdnUrls[0];
-      const audioUrl = cdnUrls[1] ?? cdnUrls[0]; // single URL = already muxed
+      const audioUrl = cdnUrls[1] ?? cdnUrls[0];
 
       console.log(`[yt-dlp] resolved ${cdnUrls.length} URL(s), handing to ffmpeg`);
 
-      // Step 2: ffmpeg merges both streams → fragmented mp4 → HTTP response
-      const ytHeaders = [
-        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer: https://www.youtube.com/',
-        'Origin: https://www.youtube.com',
-      ].join('\r\n') + '\r\n';
-
       const ffmpegArgs = [
         '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-        '-headers', ytHeaders, '-i', videoUrl,
+        '-headers', YT_FFMPEG_HEADERS, '-i', videoUrl,
       ];
 
       if (cdnUrls.length >= 2) {
         ffmpegArgs.push(
           '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-          '-headers', ytHeaders, '-i', audioUrl,
+          '-headers', YT_FFMPEG_HEADERS, '-i', audioUrl,
           '-map', '0:v:0', '-map', '1:a:0',
         );
       }
@@ -338,32 +367,12 @@ app.get('/api/download', async (req, res) => {
       req.on('close', () => ffmpeg.kill('SIGKILL'));
 
     } else {
-      // ── Direct proxy path: combined stream, no muxing needed ──
-
+      // SD combined path: decipher CDN URL via youtubei.js and proxy directly.
       const videoUrl = await format.decipher(yt.session.player);
       if (!videoUrl) return res.status(500).json({ error: 'Could not resolve video URL.' });
-
-      const fetchHeaders = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': 'https://www.youtube.com/',
-        'Origin': 'https://www.youtube.com',
-      };
-      if (req.headers.range) fetchHeaders['Range'] = req.headers.range;
-
-      const upstream = await fetch(videoUrl, { headers: fetchHeaders });
-
-      if (!upstream.ok && upstream.status !== 206) {
-        throw new Error(`YouTube CDN returned HTTP ${upstream.status}`);
-      }
-
-      res.status(upstream.status);
-      ['content-length', 'content-range', 'accept-ranges'].forEach(h => {
-        const v = upstream.headers.get(h);
-        if (v) res.setHeader(h, v);
-      });
-
-      Readable.fromWeb(upstream.body).pipe(res);
+      await proxyDirectUrl(videoUrl, req, res);
     }
+
   } catch (err) {
     console.error('[/api/download]', err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
@@ -381,5 +390,5 @@ app.listen(PORT, () => {
   console.log(`  ──────────────────────────────`);
   console.log(`  http://localhost:${PORT}`);
   console.log(`  GET /api/info?url=<yt_url>`);
-  console.log(`  GET /api/download?url=<yt_url>&itag=<itag>\n`);
+  console.log(`  GET /api/download?url=<yt_url>&itag=<itag>&mode=<both|video|audio>\n`);
 });

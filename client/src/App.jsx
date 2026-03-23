@@ -108,18 +108,25 @@ function FormatRow({ format, selected, onSelect }) {
   )
 }
 
+const MODES = [
+  { value: 'both',  label: '🔊 Audio + Video' },
+  { value: 'video', label: '🎬 Video Only' },
+  { value: 'audio', label: '🎵 Audio Only' },
+]
+
 function VideoCard({ info, url, onReset }) {
   const [selectedItag, setSelectedItag] = useState(info.formats[0]?.itag)
+  const [mode, setMode] = useState('both')
   const [downloading, setDownloading] = useState(false)
   const [dlDone, setDlDone] = useState(false)
   const [imgLoaded, setImgLoaded] = useState(false)
 
   const handleDownload = useCallback(() => {
-    if (!selectedItag) return
+    if (mode !== 'audio' && !selectedItag) return
     setDownloading(true)
     setDlDone(false)
 
-    const qs = new URLSearchParams({ url, itag: selectedItag })
+    const qs = new URLSearchParams({ url, itag: selectedItag, mode })
     const a = document.createElement('a')
     a.href = `/api/download?${qs}`
     a.download = ''
@@ -133,9 +140,10 @@ function VideoCard({ info, url, onReset }) {
       setDlDone(true)
       setTimeout(() => setDlDone(false), 3000)
     }, 1500)
-  }, [selectedItag, url])
+  }, [selectedItag, mode, url])
 
   const selectedFormat = info.formats.find(f => String(f.itag) === String(selectedItag))
+  const audioOnly = mode === 'audio'
 
   return (
     <div className="video-card">
@@ -168,23 +176,54 @@ function VideoCard({ info, url, onReset }) {
           <span className="views">{formatViews(info.viewCount)}</span>
         </div>
 
-        {/* Format selector */}
-        <div className="formats-section">
-          <p className="formats-label">Select quality</p>
-          <div className="formats-list">
-            {info.formats.map(f => (
-              <FormatRow
-                key={f.itag}
-                format={f}
-                selected={String(selectedItag) === String(f.itag)}
-                onSelect={setSelectedItag}
-              />
+        {/* Mode selector */}
+        <div className="mode-section">
+          <p className="formats-label">Download type</p>
+          <div className="mode-toggle">
+            {MODES.map(m => (
+              <button
+                key={m.value}
+                className={`mode-btn ${mode === m.value ? 'active' : ''}`}
+                onClick={() => setMode(m.value)}
+              >
+                {m.label}
+              </button>
             ))}
           </div>
-          {selectedFormat?.type === 'mux' && (
-            <p className="mux-note">
-              <IconInfo /> HD download: the server will merge the video and audio streams in real time. May take a few seconds to start.
+        </div>
+
+        {/* Format selector */}
+        <div className={`formats-section ${audioOnly ? 'dimmed' : ''}`}>
+          <p className="formats-label">
+            {audioOnly ? 'Quality (not applicable for audio)' : 'Select quality'}
+          </p>
+          {audioOnly ? (
+            <p className="audio-only-note">
+              <IconInfo /> Best available audio quality will be downloaded automatically as a <strong>.m4a</strong> file.
             </p>
+          ) : (
+            <>
+              <div className="formats-list">
+                {info.formats.map(f => (
+                  <FormatRow
+                    key={f.itag}
+                    format={f}
+                    selected={String(selectedItag) === String(f.itag)}
+                    onSelect={setSelectedItag}
+                  />
+                ))}
+              </div>
+              {mode === 'both' && selectedFormat?.type === 'mux' && (
+                <p className="mux-note">
+                  <IconInfo /> HD download: the server will merge the video and audio streams in real time. May take a few seconds to start.
+                </p>
+              )}
+              {mode === 'video' && (
+                <p className="mux-note" style={{ color: '#a78bfa', borderColor: 'rgba(167,139,250,0.2)', background: 'rgba(167,139,250,0.08)' }}>
+                  <IconInfo /> Video-only: no audio track will be included in the downloaded file.
+                </p>
+              )}
+            </>
           )}
         </div>
 
@@ -193,12 +232,16 @@ function VideoCard({ info, url, onReset }) {
           <button
             className={`btn-download ${downloading ? 'loading' : ''} ${dlDone ? 'done' : ''}`}
             onClick={handleDownload}
-            disabled={downloading || !selectedItag}
+            disabled={downloading || (mode !== 'audio' && !selectedItag)}
           >
             {downloading ? (
               <><IconSpinner /> Preparing…</>
             ) : dlDone ? (
               <><IconCheck /> Download started!</>
+            ) : mode === 'audio' ? (
+              <><IconDownload /> Download Audio</>
+            ) : mode === 'video' ? (
+              <><IconDownload /> Download Video Only</>
             ) : (
               <><IconDownload /> Download Video</>
             )}

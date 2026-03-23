@@ -375,6 +375,64 @@
   flex-shrink: 0;
 }
 
+/* ── Mode selector ───────────────────────────────────────────────────────── */
+
+.mode-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mode-toggle {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mode-btn {
+  flex: 1;
+  min-width: 110px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1.5px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 13.5px;
+  font-weight: 500;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+
+.mode-btn:hover { background: var(--surface-3); color: var(--text); }
+
+.mode-btn.active {
+  border-color: rgba(255, 0, 0, 0.45);
+  background: var(--accent-dim);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Dim format list when audio-only mode is active */
+.formats-section.dimmed {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.audio-only-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: 12.5px;
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.08);
+  border: 1px solid rgba(52, 211, 153, 0.2);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  line-height: 1.4;
+}
+.audio-only-note svg { flex-shrink: 0; margin-top: 1px; }
+.audio-only-note strong { font-weight: 600; }
+
 /* Info note for muxed HD formats */
 
 .mux-note {

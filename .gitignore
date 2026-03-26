@@ -5,3 +5,6 @@ client/dist/
 *.log
 *-player-script.js
 .claude/
+.kilocode/skills/remotion-best-practices
+.trae/skills/remotion-best-practices
+.windsurf/skills/remotion-best-practices
